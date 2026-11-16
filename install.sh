@@ -73,7 +73,7 @@ esac
 
 cat <<EOF
 
-Next steps (see https://github.com/$REPO#setup):
+Next steps (see https://github.com/$REPO#install):
   1. Agent skill (Claude Code, Codex, Gemini CLI, Copilot, OpenCode, Cursor, ...):
        npx skills add $REPO -g -y        (or: devlease skill install)
   2. Guard hooks for the agents you use (blocks device commands that skip the lease):

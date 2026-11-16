@@ -47,7 +47,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 REPO = "gohlinka2/devlease"
 HOME = Path.home()
@@ -701,8 +701,18 @@ def resolve_ios_target(cfg):
 
 
 def ios_master(cfg):
+    """The iOS master's UDID. If the config lost it (e.g. state was deleted but devices kept), adopt
+    the simulator named like the master and remember it."""
+    sims = sim_devices()
     udid = cfg["ios"].get("master_udid")
-    return udid if udid and udid in sim_devices() else None
+    if udid and udid in sims:
+        return udid
+    named = [u for u, d in sims.items() if d.get("name") == cfg["ios"]["master_name"]]
+    if len(named) == 1:
+        set_config_value("ios.master_udid", named[0])
+        cfg["ios"]["master_udid"] = named[0]
+        return named[0]
+    return None
 
 
 def create_ios_master(cfg):
@@ -1692,9 +1702,15 @@ def cmd_uninstall(args):
     sims = sim_devices()
     master_udid = cfg["ios"].get("master_udid")
     sim_targets = [(u, d["name"]) for u, d in sims.items()
-                   if u == master_udid or re.fullmatch(re.escape(SLOT_SIM_PREFIX) + r"\d+", d.get("name", ""))]
+                   if u == master_udid or d.get("name") == cfg["ios"]["master_name"] or re.fullmatch(re.escape(SLOT_SIM_PREFIX) + r"\d+", d.get("name", ""))]
     avds = lease_avds(cfg)
-    hook_targets = [(a, p) for a in HARNESSES for p in (False, True) if hooks_installed(a, p)]
+    hook_targets, seen = [], set()
+    for a in HARNESSES:
+        for p in (False, True):
+            path = hook_file(a, p).resolve()
+            if path not in seen and hooks_installed(a, p):
+                seen.add(path)
+                hook_targets.append((a, p))
     skill_dirs = [b / "devlease" for b in skill_targets().values()
                   if (b / "devlease").exists() or (b / "devlease").is_symlink()]
 

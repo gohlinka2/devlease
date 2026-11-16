@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (2026-11-16)
+
+- `uninstall` no longer lists the same hook file twice when run from the home directory.
+- `init`/`doctor`/`uninstall` find the iOS master by name when its UDID is no longer in the config.
+- Installer: fix the README link.
+
 ## 0.1.0 (2026-11-16)
 
 First public release, extracted from a private setup.
