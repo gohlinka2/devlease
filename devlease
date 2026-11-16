@@ -1,0 +1,1852 @@
+#!/usr/bin/env python3
+"""devlease: lease throwaway Android emulators and iOS simulators to parallel AI coding agents.
+
+Each lease is a fresh device made from a master image you set up once:
+  Android: a slot AVD (an APFS clone of the master with its own quick-boot snapshot) started
+           with `emulator -read-only` on a fixed port, so all changes are discarded on release.
+  iOS:     `xcrun simctl clone <master>`, deleted on release.
+The number of devices per platform is capped (RAM is the limit). State lives in ~/.devlease/
+(override with DEVLEASE_HOME).
+
+The owner of a lease is the nearest ancestor agent process (claude, codex, gemini, copilot,
+opencode, ...), or the git worktree when run from a plain shell. Leases whose owner exited or
+whose worktree is gone are freed automatically.
+
+Using devices (agents):
+  devlease acquire android|ios [--wait]   lease a device; prints its serial/UDID
+  devlease mine [android|ios]             this owner's devices (serial/UDID and MCP device id)
+  devlease release [android|ios]          stop and discard this owner's devices
+  devlease status                         all slots and who holds them
+
+Setting up (the user, once per platform):
+  devlease init android|ios               create a fresh master, open it for manual setup, build slots
+  devlease edit android|ios               change the master's data, then rebuild slots
+  devlease rebuild android|ios            rebuild slots only (e.g. after `config set android.slots 3`)
+  devlease config [get|set KEY [VALUE]]   show or change settings
+  devlease doctor                         check prerequisites and setup
+
+Integration:
+  devlease hooks install|uninstall|status [AGENT]   guard hooks for claude, codex, gemini, copilot, opencode
+  devlease skill install|uninstall|path             agent skill (prefer `npx skills add gohlinka2/devlease`)
+  devlease snippet                                  AGENTS.md section to paste into your instructions
+  devlease uninstall                                remove devices, hooks, skill, state and the binary
+"""
+import argparse
+import fcntl
+import fnmatch
+import json
+import os
+import platform as host_platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+REPO = "gohlinka2/devlease"
+HOME = Path.home()
+STATE = Path(os.environ.get("DEVLEASE_HOME") or HOME / ".devlease")
+LEASES = STATE / "leases"
+LOGS = STATE / "logs"
+CONFIG = STATE / "config.json"
+SDK = Path(os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or HOME / "Library/Android/sdk")
+AVD_HOME = Path(os.environ.get("ANDROID_AVD_HOME") or HOME / ".android/avd")
+BOOT_GRACE_S = 600
+UUID_RE = re.compile(r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b")
+SLOT_AVD_PREFIX = "lease-android-"
+SLOT_SIM_PREFIX = "lease-ios-"
+
+# Process names of agent harnesses. Node/Bun-based CLIs run as `node <path>/gemini`, so the
+# script name (argv[1]) is checked as well as the executable name.
+AGENT_NAMES = ("claude", "codex", "opencode", "gemini", "copilot", "cursor-agent", "amp", "goose", "droid",
+               "qwen", "kiro-cli", "crush", "aider", "cline", "auggie", "kimi", "junie")
+INTERPRETERS = {"node", "bun", "deno", "python", "python3", "ruby"}
+
+DEFAULT_CONFIG = {
+    "android": {
+        "slots": 2,
+        "master_avd": "lease-master-android",
+        "system_image": None,    # e.g. "system-images;android-36;google_apis_playstore;arm64-v8a"; None = newest installed
+        "template_avd": None,    # copy hardware config from this AVD instead of the built-in phone profile
+        "avd_config": {},        # config.ini overrides, e.g. {"hw.ramSize": "4096"}
+        "base_port": 5580,
+        "snapshot_port": 5578,
+        "headless": True,
+        "boot_timeout_s": 240,
+    },
+    "ios": {
+        "slots": 2,
+        "master_name": "lease-master-ios",
+        "master_udid": None,
+        "device_type": None,     # e.g. "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"; None = newest iPhone
+        "runtime": None,         # e.g. "com.apple.CoreSimulator.SimRuntime.iOS-26-5"; None = newest iOS
+    },
+    "protected_serials": [],     # devices agents must never use (e.g. your physical phone)
+    "agent_names": [],           # extra agent process names, added to the built-in list
+    "mcp_tool_patterns": ["*mobile-mcp*", "mobile_*"],   # MCP tools whose device argument is checked
+    "mcp_device_args": ["device", "deviceId", "device_id", "udid", "serial"],
+}
+
+# Built-in phone profile for new Android masters (Pixel-9a-like). Hardware graphics
+# acceleration (hw.gpu.mode=host) is much faster and more stable than "auto".
+PHONE_PROFILE = {
+    "hw.accelerometer": "yes", "hw.audioInput": "yes", "hw.battery": "yes", "hw.camera.back": "virtualscene",
+    "hw.camera.front": "emulated", "hw.cpu.ncore": "4", "hw.dPad": "no", "hw.gps": "yes", "hw.gpu.enabled": "yes",
+    "hw.gpu.mode": "host", "hw.gyroscope": "yes", "hw.initialOrientation": "portrait", "hw.keyboard": "yes",
+    "hw.lcd.density": "420", "hw.lcd.height": "2424", "hw.lcd.width": "1080", "hw.mainKeys": "no",
+    "hw.ramSize": "2048", "hw.sdCard": "yes", "hw.sensors.light": "yes", "hw.sensors.magnetic_field": "yes",
+    "hw.sensors.orientation": "yes", "hw.sensors.pressure": "yes", "hw.sensors.proximity": "yes",
+    "hw.trackBall": "no", "disk.dataPartition.size": "6G", "sdcard.size": "512M", "vm.heapSize": "228",
+    "fastboot.forceColdBoot": "no", "fastboot.forceFastBoot": "yes", "runtime.network.latency": "none",
+    "runtime.network.speed": "full", "showDeviceFrame": "no",
+}
+
+
+# ---------- helpers ----------
+
+def err(msg=""):
+    print(msg, file=sys.stderr)
+
+
+def die(msg, code=1):
+    err(f"devlease: {msg}")
+    sys.exit(code)
+
+
+def run(args, timeout=60, check=False):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=check)
+    except FileNotFoundError as e:
+        return subprocess.CompletedProcess(args, 127, "", str(e))
+
+
+def merge(base, override):
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def read_user_config():
+    if not CONFIG.exists():
+        return {}
+    try:
+        return json.loads(CONFIG.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{CONFIG} is not valid JSON: {e}")
+
+
+def load_config():
+    return merge(json.loads(json.dumps(DEFAULT_CONFIG)), read_user_config())
+
+
+def save_user_config(user):
+    STATE.mkdir(parents=True, exist_ok=True)
+    write_json(CONFIG, user)
+
+
+def set_config_value(key, value):
+    """Persist one dotted key in the user config (only what the user changed is stored)."""
+    user = read_user_config()
+    node = user
+    parts = key.split(".")
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+    node[parts[-1]] = value
+    save_user_config(user)
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+@contextmanager
+def state_lock():
+    LEASES.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def adb():
+    return shutil.which("adb") or str(SDK / "platform-tools/adb")
+
+
+def emulator_bin():
+    return str(SDK / "emulator/emulator")
+
+
+def clone_tree(src, dst):
+    """APFS copy-on-write clone (instant, no extra disk); plain copy on other file systems."""
+    r = run(["cp", "-cR", str(src), str(dst)], timeout=600)
+    if r.returncode != 0:
+        if Path(dst).exists():
+            shutil.rmtree(dst)
+        r = run(["cp", "-R", str(src), str(dst)], timeout=1800)
+        if r.returncode != 0:
+            die(f"copying {src} failed: {r.stderr.strip()}")
+
+
+# ---------- owner identity ----------
+
+def _names(comm, args):
+    names = {os.path.basename(comm)}
+    argv = args.split()
+    if argv:
+        first = os.path.basename(argv[0])
+        names.add(first)
+        if first in INTERPRETERS:
+            script = next((a for a in argv[1:] if not a.startswith("-")), "")
+            names.add(re.sub(r"\.(c|m)?js$", "", os.path.basename(script)))
+    return names
+
+
+def process_table():
+    """pid -> (ppid, {names})"""
+    comms = {}
+    for line in run(["ps", "-axo", "pid=,comm="]).stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            comms[int(parts[0])] = parts[1]
+    table = {}
+    for line in run(["ps", "-axww", "-o", "pid=,ppid=,args="]).stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2:
+            pid, ppid = int(parts[0]), int(parts[1])
+            table[pid] = (ppid, _names(comms.get(pid, ""), parts[2] if len(parts) == 3 else ""))
+    return table
+
+
+def agent_names():
+    try:
+        extra = load_config().get("agent_names") or []
+    except SystemExit:
+        extra = []
+    return tuple(AGENT_NAMES) + tuple(extra)
+
+
+def is_agent(names):
+    known = agent_names()
+    return any(name == n or name.startswith(n + "-") or name.startswith(n + ".") for name in names for n in known)
+
+
+def agent_pid():
+    if os.environ.get("DEVLEASE_OWNER_PID"):
+        return int(os.environ["DEVLEASE_OWNER_PID"])
+    table = process_table()
+    pid = os.getppid()
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        entry = table.get(pid)
+        if not entry:
+            break
+        if is_agent(entry[1]):
+            return pid
+        pid = entry[0]
+    return None
+
+
+def worktree(cwd=None):
+    cwd = cwd or os.getcwd()
+    r = run(["git", "-C", cwd, "rev-parse", "--show-toplevel"])
+    return r.stdout.strip() if r.returncode == 0 else os.path.abspath(cwd)
+
+
+def current_owner(cwd=None):
+    return {"agent_pid": agent_pid(), "worktree": worktree(cwd)}
+
+
+def owns(lease, owner):
+    if owner["agent_pid"] is not None:
+        return lease.get("agent_pid") == owner["agent_pid"]
+    return lease.get("agent_pid") is None and lease.get("worktree") == owner["worktree"]
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    if os.environ.get("DEVLEASE_OWNER_PID") == str(pid):
+        return True
+    comm = run(["ps", "-p", str(pid), "-o", "comm="]).stdout.strip()
+    args = run(["ps", "-ww", "-p", str(pid), "-o", "args="]).stdout.strip()
+    return bool(comm) and is_agent(_names(comm, args))
+
+
+# ---------- leases ----------
+
+def lease_path(platform, slot):
+    return LEASES / f"{platform}-{slot}.json"
+
+
+def all_leases():
+    leases = []
+    if LEASES.exists():
+        for p in sorted(LEASES.glob("*.json")):
+            try:
+                leases.append(json.loads(p.read_text()))
+            except (OSError, json.JSONDecodeError):
+                pass
+    return leases
+
+
+def owner_leases(owner, platform=None):
+    return [l for l in all_leases() if owns(l, owner) and (platform is None or l["platform"] == platform)]
+
+
+def drop_lease(lease):
+    lease_path(lease["platform"], lease["slot"]).unlink(missing_ok=True)
+
+
+def mcp_id(lease):
+    return lease.get("mcp_id") or lease.get("device")
+
+
+# ---------- device state ----------
+
+def adb_serials():
+    out = run([adb(), "devices"]).stdout
+    return {line.split()[0] for line in out.splitlines()[1:] if line.strip()}
+
+
+def simctl_json(*what):
+    if not shutil.which("xcrun"):
+        return {}
+    out = run(["xcrun", "simctl", "list", *what, "-j"], timeout=60).stdout
+    try:
+        return json.loads(out or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def sim_devices():
+    devices = {}
+    for runtime, runtime_devices in simctl_json("devices").get("devices", {}).items():
+        for d in runtime_devices:
+            devices[d["udid"]] = dict(d, runtime=runtime)
+    return devices
+
+
+def device_alive(lease, serials, sims):
+    if lease["platform"] == "android":
+        return lease.get("device") in serials
+    d = sims.get(lease.get("device") or "")
+    return d is not None and d.get("state") == "Booted"
+
+
+def port_free(port):
+    for p in (port, port + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            if s.connect_ex(("127.0.0.1", p)) == 0:
+                return False
+    return True
+
+
+def stop_device(lease):
+    device = lease.get("device")
+    if lease["platform"] == "android":
+        if device:
+            run([adb(), "-s", device, "emu", "kill"], timeout=20)
+            for _ in range(20):
+                if device not in adb_serials():
+                    break
+                time.sleep(1)
+        pid = lease.get("emulator_pid")
+        if pid:
+            try:
+                os.kill(pid, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+    else:
+        target = device or f"{SLOT_SIM_PREFIX}{lease['slot']}"
+        run(["xcrun", "simctl", "shutdown", target], timeout=60)
+        run(["xcrun", "simctl", "delete", target], timeout=60)
+
+
+def reap(verbose=False):
+    """Free stale leases and orphaned devices. Caller holds the state lock."""
+    cfg = load_config()
+    serials = adb_serials() if Path(adb()).exists() else set()
+    sims = sim_devices()
+    now = time.time()
+    freed = []
+    for lease in all_leases():
+        booting = lease.get("state") == "booting" and now - lease.get("acquired_at", 0) < BOOT_GRACE_S
+        reason = None
+        if lease.get("agent_pid") is not None and not pid_alive(lease["agent_pid"]):
+            reason = "owner process exited"
+        elif lease.get("agent_pid") is None and lease.get("worktree") and not os.path.isdir(lease["worktree"]):
+            reason = "worktree removed"
+        elif not booting and not device_alive(lease, serials, sims):
+            reason = "device no longer running"
+        if reason:
+            stop_device(lease)
+            drop_lease(lease)
+            freed.append((lease, reason))
+            if verbose:
+                err(f"devlease: freed {lease['platform']}-{lease['slot']} ({lease.get('device')}): {reason}")
+    # Orphans: emulators on lease ports / lease-ios-* simulators without a lease file.
+    leased = {(l["platform"], l["slot"]) for l in all_leases()}
+    a = cfg["android"]
+    for slot in range(a["slots"]):
+        serial = f"emulator-{a['base_port'] + 2 * slot}"
+        if ("android", slot) not in leased and serial in serials:
+            stop_device({"platform": "android", "slot": slot, "device": serial})
+    for udid, d in sims.items():
+        m = re.fullmatch(re.escape(SLOT_SIM_PREFIX) + r"(\d+)", d.get("name", ""))
+        if m and ("ios", int(m.group(1))) not in leased:
+            stop_device({"platform": "ios", "slot": int(m.group(1)), "device": udid})
+    return freed
+
+
+# ---------- Android masters and slots ----------
+
+def slot_avd_name(slot):
+    return f"{SLOT_AVD_PREFIX}{slot}"
+
+
+def avd_exists(name):
+    return (AVD_HOME / f"{name}.ini").exists() and (AVD_HOME / f"{name}.avd").is_dir()
+
+
+def delete_avd(name):
+    shutil.rmtree(AVD_HOME / f"{name}.avd", ignore_errors=True)
+    (AVD_HOME / f"{name}.ini").unlink(missing_ok=True)
+
+
+def lease_avds(cfg):
+    """All AVDs devlease created: the master and every slot AVD (also leftovers beyond `slots`)."""
+    names = []
+    if AVD_HOME.is_dir():
+        for ini in sorted(AVD_HOME.glob("*.ini")):
+            n = ini.stem
+            if n == cfg["android"]["master_avd"] or re.fullmatch(re.escape(SLOT_AVD_PREFIX) + r"\d+", n):
+                names.append(n)
+    return names
+
+
+def master_running_android(cfg):
+    out = run(["ps", "-axww", "-o", "command="]).stdout
+    avds = [cfg["android"]["master_avd"]] + [slot_avd_name(i) for i in range(cfg["android"]["slots"])]
+    return any(f"-avd {avd} " in l + " " and "-read-only" not in l and "qemu" in l
+               for l in out.splitlines() for avd in avds)
+
+
+def host_abi():
+    return "arm64-v8a" if host_platform.machine() in ("arm64", "aarch64") else "x86_64"
+
+
+def read_props(path):
+    props = {}
+    if path.exists():
+        for line in path.read_text(errors="replace").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                props[k.strip()] = v.strip()
+    return props
+
+
+def installed_system_images():
+    """[(api_level, tag_rank, rel_path, props)] for phone images matching the host ABI, best first."""
+    tag_rank = {"google_apis_playstore": 0, "google_apis": 1, "default": 2}
+    images = []
+    root = SDK / "system-images"
+    if not root.is_dir():
+        return images
+    for d in root.glob("*/*/*"):
+        if d.name != host_abi() or not (d / "source.properties").exists():
+            continue
+        tag = d.parent.name
+        if any(x in tag for x in ("wear", "tv", "automotive", "desktop", "xr")):
+            continue
+        props = read_props(d / "source.properties")
+        try:
+            api = float(props.get("AndroidVersion.ApiLevel") or re.sub(r"[^0-9.]", "", d.parent.parent.name) or 0)
+        except ValueError:
+            api = 0
+        images.append((api, tag_rank.get(tag, 9), f"system-images/{d.parent.parent.name}/{tag}/{d.name}/", props))
+    images.sort(key=lambda i: (-i[0], i[1]))
+    return images
+
+
+def resolve_system_image(cfg):
+    want = cfg["android"].get("system_image")
+    if want:
+        rel = want.replace(";", "/").strip("/") + "/"
+        if not (SDK / rel).is_dir():
+            die(f"system image {want} is not installed in {SDK}. Install it with Android Studio's SDK Manager "
+                f"or `sdkmanager \"{want.replace('/', ';').strip(';')}\"`.")
+        props = read_props(SDK / rel / "source.properties")
+        api = float(props.get("AndroidVersion.ApiLevel") or 0)
+        return api, rel, props
+    images = installed_system_images()
+    if not images:
+        die(f"no {host_abi()} phone system image found in {SDK}/system-images. Install one in Android Studio "
+            "(Settings > Languages & Frameworks > Android SDK > SDK Platforms > a Google Play image), "
+            "or set android.template_avd to an AVD you already have.")
+    api, _, rel, props = images[0]
+    return api, rel, props
+
+
+def write_config_ini(path, values):
+    path.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+
+
+def create_master_avd(cfg):
+    a = cfg["android"]
+    name = a["master_avd"]
+    avd_dir = AVD_HOME / f"{name}.avd"
+    AVD_HOME.mkdir(parents=True, exist_ok=True)
+    if a.get("template_avd"):
+        template = AVD_HOME / f"{a['template_avd']}.avd/config.ini"
+        if not template.exists():
+            die(f"template AVD config {template} not found (android.template_avd = {a['template_avd']!r})")
+        values = read_props(template)
+        source = f"template AVD {a['template_avd']}"
+    else:
+        api, rel, props = resolve_system_image(cfg)
+        tag = props.get("SystemImage.TagId") or rel.split("/")[2]
+        api_str = str(int(api)) if api == int(api) else str(api)
+        display = props.get("SystemImage.TagDisplay", tag)
+        values = {
+            "avd.ini.encoding": "UTF-8",
+            "PlayStore.enabled": "true" if tag == "google_apis_playstore" else "false",
+            "abi.type": host_abi(),
+            "hw.cpu.arch": "arm64" if host_abi() == "arm64-v8a" else "x86_64",
+            "image.sysdir.1": rel,
+            "tag.id": tag, "tag.ids": tag, "tag.display": display, "tag.displaynames": display,
+            "target": f"android-{api_str}",
+        }
+        values.update(PHONE_PROFILE)
+        source = rel.rstrip("/")
+    values["AvdId"] = name
+    values["avd.ini.displayname"] = name
+    values["hw.gpu.enabled"] = "yes"
+    values["hw.gpu.mode"] = "host"
+    values.update({k: str(v) for k, v in (a.get("avd_config") or {}).items()})
+    avd_dir.mkdir(parents=True)
+    write_config_ini(avd_dir / "config.ini", values)
+    target = values.get("target", "android-36")
+    (AVD_HOME / f"{name}.ini").write_text(
+        f"avd.ini.encoding=UTF-8\npath={avd_dir}\npath.rel=avd/{name}.avd\ntarget={target}\n")
+    err(f"devlease: created master AVD {name} from {source} (hardware graphics acceleration)")
+
+
+def boot_master_window(avd):
+    err(f"devlease: {avd} is starting in a window. Set it up the way every leased device should start\n"
+        "  (sign-ins, settings, apps, developer options...), then close the emulator window.\n"
+        "  Slot devices are rebuilt from it afterwards.")
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(LOGS / "master-android.log", "w") as log:
+        r = subprocess.run([emulator_bin(), "-avd", avd, "-no-audio", "-no-boot-anim"],
+                           stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        err(f"devlease: emulator exited with code {r.returncode}; see {LOGS / 'master-android.log'}")
+
+
+def snapshot_avd(cfg, avd, log_name):
+    """Boot an AVD headless (not read-only) and shut it down so its quick-boot snapshot is saved."""
+    port = cfg["android"]["snapshot_port"]
+    serial = f"emulator-{port}"
+    if not port_free(port):
+        die(f"port {port} (android.snapshot_port, used for snapshotting) is busy")
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log = open(LOGS / log_name, "w")
+    proc = subprocess.Popen([emulator_bin(), "-avd", avd, "-no-audio", "-no-boot-anim", "-no-window", "-port", str(port)],
+                            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            die(f"{avd} exited while booting; see {LOGS / log_name}")
+        if run([adb(), "-s", serial, "shell", "getprop", "sys.boot_completed"], timeout=15).stdout.strip() == "1":
+            break
+        time.sleep(3)
+    else:
+        proc.terminate()
+        die(f"{avd} did not boot in 10 min; see {LOGS / log_name}")
+    time.sleep(20)  # let first-boot services settle before snapshotting
+    run([adb(), "-s", serial, "emu", "kill"], timeout=30)
+    proc.wait(timeout=180)
+    if not (AVD_HOME / f"{avd}.avd/snapshots/default_boot").exists():
+        die(f"{avd}: quick-boot snapshot was not saved; see {LOGS / log_name}")
+
+
+def build_slot_avd(cfg, slot):
+    """Slot AVD = clone of the master with its own name and its own snapshot.
+
+    Mobile MCP (mobilecli) identifies emulators by ro.boot.qemu.avd_name, which a snapshot restores
+    from RAM, so each slot needs a distinct AVD whose snapshot was taken under its own name.
+    """
+    a = cfg["android"]
+    name = slot_avd_name(slot)
+    master_dir = AVD_HOME / f"{a['master_avd']}.avd"
+    avd_dir = AVD_HOME / f"{name}.avd"
+    if avd_dir.exists():
+        shutil.rmtree(avd_dir)
+    clone_tree(master_dir, avd_dir)
+    for leftover in ("snapshots", "hardware-qemu.ini", "emu-launch-params.txt", "initrd", "read-snapshot.txt",
+                     "snapshot.trace", "bootcompleted.ini", "multiinstance.lock", "tmpAdbCmds"):
+        path = avd_dir / leftover
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    for lock in avd_dir.glob("*.lock"):
+        shutil.rmtree(lock) if lock.is_dir() else lock.unlink()
+    config = []
+    for line in (master_dir / "config.ini").read_text().splitlines():
+        if line.startswith("AvdId="):
+            line = f"AvdId={name}"
+        elif line.startswith("avd.ini.displayname="):
+            line = f"avd.ini.displayname={name}"
+        config.append(line)
+    (avd_dir / "config.ini").write_text("\n".join(config) + "\n")
+    ini = (AVD_HOME / f"{a['master_avd']}.ini").read_text().replace(f"{a['master_avd']}.avd", f"{name}.avd")
+    (AVD_HOME / f"{name}.ini").write_text(ini)
+    snapshot_avd(cfg, name, f"slot-android-{slot}.log")
+    err(f"devlease: built slot AVD {name}")
+
+
+def rebuild_android(cfg):
+    a = cfg["android"]
+    if not avd_exists(a["master_avd"]):
+        die(f"master AVD {a['master_avd']} not found; run `devlease init android`")
+    if master_running_android(cfg):
+        die(f"master AVD {a['master_avd']} is running; close it first")
+    for slot in range(a["slots"]):
+        build_slot_avd(cfg, slot)
+    for name in lease_avds(cfg):
+        m = re.fullmatch(re.escape(SLOT_AVD_PREFIX) + r"(\d+)", name)
+        if m and int(m.group(1)) >= a["slots"]:
+            delete_avd(name)
+            err(f"devlease: deleted surplus slot AVD {name}")
+    err(f"devlease: {a['slots']} Android slot(s) ready")
+
+
+def boot_android(cfg, slot):
+    a = cfg["android"]
+    if master_running_android(cfg):
+        raise RuntimeError(f"master AVD {a['master_avd']} is running normally; close it first")
+    port = a["base_port"] + 2 * slot
+    if not port_free(port):
+        raise RuntimeError(f"port {port} is in use")
+    serial = f"emulator-{port}"
+    avd = slot_avd_name(slot)
+    if not (AVD_HOME / f"{avd}.avd/snapshots/default_boot").exists():
+        raise RuntimeError(f"slot AVD {avd} missing; ask the user to run `devlease init android` "
+                           "(or `devlease rebuild android`)")
+    update_lease("android", slot, mcp_id=avd)
+    args = [emulator_bin(), "-avd", avd, "-read-only", "-port", str(port), "-no-audio", "-no-boot-anim"]
+    if a.get("headless", True):
+        args.append("-no-window")
+    log = open(LOGS / f"android-{slot}.log", "w")
+    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    update_lease("android", slot, device=serial, emulator_pid=proc.pid)
+    deadline = time.time() + a["boot_timeout_s"]
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"emulator exited (code {proc.returncode}); see {LOGS / f'android-{slot}.log'}")
+        r = run([adb(), "-s", serial, "shell", "getprop", "sys.boot_completed"], timeout=15)
+        if r.stdout.strip() == "1":
+            return serial
+        time.sleep(2)
+    raise RuntimeError(f"{serial} did not finish booting in {a['boot_timeout_s']} s")
+
+
+# ---------- iOS master ----------
+
+def resolve_ios_target(cfg):
+    i = cfg["ios"]
+    runtime, device_type = i.get("runtime"), i.get("device_type")
+    runtimes = [r for r in simctl_json("runtimes").get("runtimes", [])
+                if r.get("isAvailable") and r.get("platform", "iOS") == "iOS" and "iOS" in r.get("name", "iOS")]
+    if not runtime:
+        if not runtimes:
+            die("no iOS simulator runtime installed; install one in Xcode > Settings > Components")
+        best = max(runtimes, key=lambda r: [int(x) for x in re.findall(r"\d+", r.get("version", "0"))])
+        runtime = best["identifier"]
+    if not device_type:
+        rt = next((r for r in runtimes if r["identifier"] == runtime), None)
+        types = (rt or {}).get("supportedDeviceTypes") or simctl_json("devicetypes").get("devicetypes", [])
+        iphones = [t for t in types if t.get("productFamily", "iPhone") == "iPhone" and t.get("name", "").startswith("iPhone")]
+        if not iphones:
+            die(f"no iPhone device type for runtime {runtime}; set ios.device_type")
+
+        def rank(t):
+            n = t["name"]
+            num = [int(x) for x in re.findall(r"\d+", n)] or [0]
+            return (num[0], n.endswith(" Pro"), "Pro Max" not in n and "Plus" not in n)
+        device_type = max(iphones, key=rank)["identifier"]
+    return device_type, runtime
+
+
+def ios_master(cfg):
+    udid = cfg["ios"].get("master_udid")
+    return udid if udid and udid in sim_devices() else None
+
+
+def create_ios_master(cfg):
+    i = cfg["ios"]
+    device_type, runtime = resolve_ios_target(cfg)
+    r = run(["xcrun", "simctl", "create", i["master_name"], device_type, runtime], timeout=120)
+    if r.returncode != 0:
+        die(f"simctl create failed: {r.stderr.strip()}")
+    udid = r.stdout.strip()
+    set_config_value("ios.master_udid", udid)
+    err(f"devlease: created simulator {i['master_name']} ({udid}, {device_type.rsplit('.', 1)[-1]}, "
+        f"{runtime.rsplit('.', 1)[-1]})")
+    return udid
+
+
+def ios_boot_once(udid):
+    run(["xcrun", "simctl", "boot", udid], timeout=120)
+    run(["xcrun", "simctl", "bootstatus", udid, "-b"], timeout=600)
+    run(["xcrun", "simctl", "shutdown", udid], timeout=120)
+
+
+def ios_setup_window(udid):
+    run(["xcrun", "simctl", "boot", udid], timeout=120)
+    run(["xcrun", "simctl", "bootstatus", udid, "-b"], timeout=600)
+    run(["open", "-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
+    err("devlease: the iOS master is open in Simulator. Set it up the way every leased device should start\n"
+        "  (sign-ins, settings, apps...). When done, shut it down: close its window or quit Simulator, or run\n"
+        f"  `xcrun simctl shutdown {udid}`. Waiting for it to shut down...")
+    while True:
+        d = sim_devices().get(udid)
+        if not d or d.get("state") == "Shutdown":
+            break
+        time.sleep(3)
+    err("devlease: iOS master shut down; leased simulators are cloned from it from now on")
+
+
+def boot_ios(cfg, slot):
+    i = cfg["ios"]
+    master = i.get("master_udid")
+    sims = sim_devices()
+    if not master or master not in sims:
+        raise RuntimeError("iOS master simulator missing; ask the user to run `devlease init ios`")
+    if sims[master].get("state") != "Shutdown":
+        raise RuntimeError(f"iOS master simulator {master} is {sims[master].get('state')}; shut it down first")
+    name = f"{SLOT_SIM_PREFIX}{slot}"
+    r = run(["xcrun", "simctl", "clone", master, name], timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f"simctl clone failed: {r.stderr.strip()}")
+    udid = r.stdout.strip()
+    update_lease("ios", slot, device=udid)
+    run(["xcrun", "simctl", "boot", udid], timeout=120)
+    r = run(["xcrun", "simctl", "bootstatus", udid, "-b"], timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"simctl bootstatus failed: {r.stderr.strip()}")
+    return udid
+
+
+def update_lease(platform, slot, **fields):
+    with state_lock():
+        path = lease_path(platform, slot)
+        if path.exists():
+            lease = json.loads(path.read_text())
+            lease.update(fields)
+            write_json(path, lease)
+
+
+# ---------- lease commands ----------
+
+def cmd_acquire(args):
+    cfg = load_config()
+    platform = args.platform
+    owner = current_owner()
+    deadline = time.time() + args.timeout
+    announced = False
+    while True:
+        with state_lock():
+            reap(verbose=True)
+            mine = owner_leases(owner, platform)
+            if mine:
+                lease = mine[0]
+                if lease.get("state") == "ready":
+                    err(f"devlease: you already hold {platform}-{lease['slot']} (MCP device id: {mcp_id(lease)})")
+                    print(lease["device"])
+                    return 0
+                die(f"a lease for this owner is still booting ({platform}-{lease['slot']})")
+            taken = {l["slot"] for l in all_leases() if l["platform"] == platform}
+            free = [s for s in range(cfg[platform]["slots"]) if s not in taken]
+            if free:
+                slot = free[0]
+                write_json(lease_path(platform, slot), {
+                    "platform": platform, "slot": slot, "device": None, "state": "booting",
+                    "agent_pid": owner["agent_pid"], "worktree": owner["worktree"], "acquired_at": time.time(),
+                })
+                break
+        if not args.wait:
+            err(f"devlease: all {platform} slots are taken (use --wait to wait for one)")
+            print_status(sys.stderr)
+            return 3
+        if time.time() > deadline:
+            die(f"timed out waiting for a free {platform} slot", 3)
+        if not announced:
+            err(f"devlease: all {platform} slots taken, waiting...")
+            announced = True
+        time.sleep(5)
+
+    started = time.time()
+    try:
+        device = boot_android(cfg, slot) if platform == "android" else boot_ios(cfg, slot)
+    except Exception as e:
+        with state_lock():
+            path = lease_path(platform, slot)
+            if path.exists():
+                lease = json.loads(path.read_text())
+                stop_device(lease)
+                drop_lease(lease)
+        die(str(e))
+    update_lease(platform, slot, state="ready", device=device)
+    mcp = slot_avd_name(slot) if platform == "android" else device
+    err(f"devlease: {platform}-{slot} ready in {time.time() - started:.0f} s "
+        f"({'serial' if platform == 'android' else 'UDID'} {device}, MCP device id: {mcp})")
+    print(device)
+    return 0
+
+
+def cmd_release(args):
+    with state_lock():
+        if args.device:
+            targets = [l for l in all_leases() if l.get("device") == args.device or l.get("mcp_id") == args.device]
+        elif args.owner_pid:
+            targets = [l for l in all_leases() if l.get("agent_pid") == args.owner_pid]
+        elif args.all:
+            targets = all_leases()
+        else:
+            targets = owner_leases(current_owner(), args.platform)
+        for lease in targets:
+            stop_device(lease)
+            drop_lease(lease)
+            err(f"devlease: released {lease['platform']}-{lease['slot']} ({lease.get('device')})")
+        if not targets:
+            err("devlease: nothing to release")
+    return 0
+
+
+def cmd_mine(args):
+    for lease in owner_leases(current_owner(), args.platform):
+        if lease.get("state") == "ready":
+            print(f"{lease['platform']}\t{lease['device']}\tmcp: {mcp_id(lease)}")
+    return 0
+
+
+def print_status(out=sys.stdout):
+    cfg = load_config()
+    leases = {(l["platform"], l["slot"]): l for l in all_leases()}
+    now = time.time()
+    for platform in ("android", "ios"):
+        for slot in range(cfg[platform]["slots"]):
+            l = leases.get((platform, slot))
+            if not l:
+                print(f"{platform}-{slot}\tfree", file=out)
+                continue
+            age = int((now - l.get("acquired_at", now)) / 60)
+            pid = l.get("agent_pid")
+            alive = "alive" if pid is None or pid_alive(pid) else "dead"
+            print(f"{platform}-{slot}\t{l.get('state')}\t{l.get('device')}\tmcp: {mcp_id(l)}\tpid={pid} ({alive})"
+                  f"\t{age} min\t{l.get('worktree')}", file=out)
+
+
+def cmd_status(args):
+    with state_lock():
+        reap(verbose=True)
+    print_status()
+    return 0
+
+
+def cmd_reap(args):
+    with state_lock():
+        freed = reap(verbose=True)
+    if not freed:
+        err("devlease: nothing stale")
+    return 0
+
+
+# ---------- master commands ----------
+
+def require_no_leases():
+    with state_lock():
+        reap()
+        if all_leases():
+            die("devices are leased right now; they must be released before the master changes "
+                "(`devlease status` shows who holds them)")
+
+
+def cmd_init(args):
+    cfg = load_config()
+    require_no_leases()
+    if args.platform == "android":
+        name = cfg["android"]["master_avd"]
+        if avd_exists(name):
+            if not args.force:
+                die(f"master AVD {name} already exists. Use `devlease edit android` to change its data, "
+                    "or `devlease init android --force` to delete it and start fresh.")
+            for n in lease_avds(cfg):
+                delete_avd(n)
+            err(f"devlease: deleted {name} and its slots")
+        create_master_avd(cfg)
+        if not args.no_setup:
+            boot_master_window(name)
+        rebuild_android(cfg)
+    else:
+        udid = ios_master(cfg)
+        if udid:
+            if not args.force:
+                die(f"iOS master {udid} already exists. Use `devlease edit ios` to change its data, "
+                    "or `devlease init ios --force` to delete it and start fresh.")
+            run(["xcrun", "simctl", "shutdown", udid], timeout=60)
+            run(["xcrun", "simctl", "delete", udid], timeout=60)
+            err(f"devlease: deleted iOS master {udid}")
+        udid = create_ios_master(cfg)
+        if args.no_setup:
+            ios_boot_once(udid)
+        else:
+            ios_setup_window(udid)
+        err(f"devlease: iOS master ready ({cfg['ios']['slots']} slot(s); simulators are cloned at lease time)")
+    err(f"devlease: agents can now run `devlease acquire {args.platform} --wait`")
+    return 0
+
+
+def cmd_edit(args):
+    cfg = load_config()
+    require_no_leases()
+    if args.platform == "android":
+        name = cfg["android"]["master_avd"]
+        if not avd_exists(name):
+            die(f"master AVD {name} not found; run `devlease init android` first")
+        if master_running_android(cfg):
+            die(f"{name} is already running; close it first")
+        boot_master_window(name)
+        rebuild_android(cfg)
+    else:
+        udid = ios_master(cfg)
+        if not udid:
+            die("iOS master not found; run `devlease init ios` first")
+        ios_setup_window(udid)
+    return 0
+
+
+def cmd_rebuild(args):
+    cfg = load_config()
+    require_no_leases()
+    if args.platform == "android":
+        rebuild_android(cfg)
+    else:
+        if not ios_master(cfg):
+            die("iOS master not found; run `devlease init ios` first")
+        err("devlease: nothing to rebuild for iOS: leased simulators are cloned from the master at lease time")
+    return 0
+
+
+def cmd_master(args):
+    """Deprecated alias kept for older instructions."""
+    cfg = load_config()
+    exists = avd_exists(cfg["android"]["master_avd"]) if args.platform == "android" else bool(ios_master(cfg))
+    args.force = False
+    if args.setup:
+        err("devlease: `master --setup` is deprecated; use `devlease init` / `devlease edit`")
+        args.no_setup = False
+        return cmd_edit(args) if exists else cmd_init(args)
+    err("devlease: `master` is deprecated; use `devlease rebuild` (or `devlease init` for a new master)")
+    if not exists:
+        args.no_setup = True
+        return cmd_init(args)
+    return cmd_rebuild(args)
+
+
+# ---------- config / doctor ----------
+
+def parse_value(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.action in (None, "show"):
+        print(json.dumps(cfg, indent=2))
+        return 0
+    if args.action == "path":
+        print(CONFIG)
+        return 0
+    if not args.key:
+        die("config get|set|unset needs a KEY, e.g. `devlease config set android.slots 3`")
+    if args.action == "get":
+        node = cfg
+        for p in args.key.split("."):
+            if not isinstance(node, dict) or p not in node:
+                die(f"unknown key {args.key}")
+            node = node[p]
+        print(node if isinstance(node, str) else json.dumps(node))
+        return 0
+    if args.action == "set":
+        if args.value is None:
+            die("config set needs a VALUE (JSON or a plain string)")
+        if args.key.split(".")[0] not in DEFAULT_CONFIG:
+            die(f"unknown key {args.key}; known top-level keys: {', '.join(DEFAULT_CONFIG)}")
+        value = parse_value(args.value)
+        set_config_value(args.key, value)
+        err(f"devlease: {args.key} = {json.dumps(value)}")
+        if args.key == "android.slots":
+            err("devlease: run `devlease rebuild android` to build the slot AVDs")
+        return 0
+    user = read_user_config()  # unset
+    node = user
+    parts = args.key.split(".")
+    for p in parts[:-1]:
+        node = node.get(p, {})
+    node.pop(parts[-1], None)
+    save_user_config(user)
+    return 0
+
+
+def cmd_doctor(args):
+    cfg = load_config()
+    problems = 0
+
+    def check(ok, label, fix="", optional=False):
+        nonlocal problems
+        mark = "ok" if ok else "--" if optional else "!!"
+        print(f"  [{mark}] {label}" + ("" if ok or not fix else f"\n       {'optional' if optional else 'fix'}: {fix}"))
+        if not ok and not optional:
+            problems += 1
+        return ok
+
+    print(f"devlease {__version__} ({Path(__file__).resolve()})")
+    print(f"state: {STATE}")
+    check(sys.platform == "darwin", "macOS", "devlease supports macOS only")
+    check(sys.version_info >= (3, 8), f"python {sys.version.split()[0]}", "install Python 3.8+")
+    on_path = shutil.which("devlease")
+    check(bool(on_path), f"devlease on PATH ({on_path})", "add the install dir (default ~/.local/bin) to PATH")
+    print("android:")
+    if check(Path(emulator_bin()).exists(), f"emulator ({emulator_bin()})",
+             "install Android Studio (or the SDK emulator package); set ANDROID_HOME if the SDK is elsewhere"):
+        check(Path(adb()).exists(), "adb", "install SDK platform-tools")
+        a = cfg["android"]
+        if a.get("template_avd"):
+            check((AVD_HOME / f"{a['template_avd']}.avd/config.ini").exists(), f"template AVD {a['template_avd']}")
+        else:
+            images = installed_system_images()
+            check(bool(images) or bool(a.get("system_image")),
+                  f"system image: {a.get('system_image') or (images[0][2] if images else 'none')}",
+                  "install a Google Play phone system image in Android Studio's SDK Manager")
+        master = a["master_avd"]
+        if check(avd_exists(master), f"master AVD {master}", "the user runs `devlease init android`"):
+            gpu = read_props(AVD_HOME / f"{master}.avd/config.ini").get("hw.gpu.mode")
+            check(gpu == "host", f"master graphics acceleration: {gpu}",
+                  f"set hw.gpu.mode=host in {AVD_HOME / (master + '.avd/config.ini')}, then `devlease rebuild android`")
+            missing = [s for s in range(a["slots"])
+                       if not (AVD_HOME / f"{slot_avd_name(s)}.avd/snapshots/default_boot").exists()]
+            check(not missing, f"{a['slots']} slot AVD(s)" + (f", missing {missing}" if missing else ""),
+                  "run `devlease rebuild android`")
+    print("ios:")
+    if check(bool(shutil.which("xcrun")) and run(["xcrun", "simctl", "help"]).returncode == 0, "Xcode simctl",
+             "install Xcode and run `sudo xcode-select -s /Applications/Xcode.app`"):
+        udid = ios_master(cfg)
+        check(bool(udid), f"iOS master {udid or cfg['ios']['master_name']}", "the user runs `devlease init ios`")
+    print("integration:")
+    for agent in HARNESSES:
+        if harness_present(agent):
+            check(hooks_installed(agent, False), f"{agent} guard hooks", f"devlease hooks install {agent}",
+                  optional=agent != "claude")
+    skill_dirs = [d for d in skill_targets().values() if (d / "devlease" / "SKILL.md").exists()]
+    check(bool(skill_dirs), "agent skill" + (f" ({', '.join(str(d) for d in skill_dirs)})" if skill_dirs else ""),
+          f"npx skills add {REPO} -g -y   (or `devlease skill install`)")
+    try:
+        free_gb = shutil.disk_usage(AVD_HOME if AVD_HOME.exists() else HOME).free / 1e9
+        check(free_gb > 15, f"free disk {free_gb:.0f} GB", "free some disk space (a master needs ~5-10 GB)")
+    except OSError:
+        pass
+    print("all good" if not problems else f"{problems} problem(s)")
+    return 1 if problems else 0
+
+
+# ---------- guard (hook) logic ----------
+
+WRAPPERS = {"env", "time", "nohup", "sudo", "command", "exec", "nice", "caffeinate", "timeout", "gtimeout"}
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+DEVICE_WORDS = re.compile(r"adb|gradle|simctl|xcodebuild|emulator|flutter|maestro")
+
+
+def strip_heredocs(command):
+    """Drop heredoc bodies: they are data (file contents, scripts), not commands to check."""
+    out = []
+    lines = command.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        delimiters = [m.group(2) for m in HEREDOC.finditer(line)]
+        i += 1
+        for d in delimiters:
+            while i < len(lines) and lines[i].strip() != d:
+                i += 1
+            i += 1
+    return "\n".join(out)
+
+
+def split_segments(command):
+    """Split at ; & | && || and newlines outside quotes."""
+    segments, cur, quote, i = [], [], None, 0
+    text = strip_heredocs(command)
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < len(text):
+                cur.append(text[i:i + 2])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            cur.append(c)
+        elif c == "\\" and i + 1 < len(text):
+            cur.append(text[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in ";|\n" or (c == "&" and not text[i + 1:i + 2] == ">" and not text[i - 1:i] in (">", "<")):
+            segments.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    segments.append("".join(cur))
+    return [s.strip() for s in segments if s.strip()]
+
+
+def tokenize(segment):
+    try:
+        return shlex.split(segment, comments=True)
+    except ValueError:
+        return segment.split()
+
+
+def is_var(token):
+    """`$VAR` / `${VAR}`: can't be resolved here, so trust it when the session holds a lease."""
+    return bool(token) and re.fullmatch(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", token) is not None
+
+
+def protected_msg(serial):
+    return f"{serial} is a protected device (protected_serials); never use it"
+
+
+def check_serial(serial, leased_set, protected, what):
+    if serial in protected:
+        return protected_msg(serial)
+    if serial not in leased_set and not (is_var(serial) and leased_set):
+        return f"{what} {serial}, which this session has not leased"
+    return None
+
+
+def flag_value(rest, names):
+    for i, t in enumerate(rest):
+        if t in names and i + 1 < len(rest):
+            return rest[i + 1]
+        for n in names:
+            if n.startswith("--") and t.startswith(n + "="):
+                return t.split("=", 1)[1]
+    return None
+
+
+def check_segment(tokens, env, leased, protected):
+    """Return a block reason or None. `env` carries exports from earlier segments."""
+    tokens = list(tokens)
+    local_env = dict(env)
+    while tokens and (ASSIGN.match(tokens[0]) or os.path.basename(tokens[0]) in WRAPPERS
+                      or tokens[0].startswith("-") or re.fullmatch(r"\d+(\.\d+)?[smhd]?", tokens[0])):
+        m = ASSIGN.match(tokens[0])
+        if m:
+            local_env[m.group(1)] = m.group(2)
+        tokens.pop(0)
+    if not tokens:
+        return None
+    prog = os.path.basename(tokens[0])
+    rest = tokens[1:]
+    android = leased["android"]
+    ios = leased["ios"]
+
+    if prog == "export":
+        for t in rest:
+            m = ASSIGN.match(t)
+            if m:
+                env[m.group(1)] = m.group(2)
+        return None
+    if prog in ("bash", "sh", "zsh") and "-c" in rest:
+        i = rest.index("-c")
+        if i + 1 < len(rest):
+            return check_command(rest[i + 1], leased, protected, env)
+        return None
+    if prog == "devlease":
+        return None
+
+    if prog == "adb":
+        serial = local_env.get("ANDROID_SERIAL")
+        sub = None
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t == "-s" and i + 1 < len(rest):
+                serial = rest[i + 1]
+                i += 2
+                continue
+            if t in ("-d", "-e"):
+                return f"`adb {t}` picks an arbitrary device; use `adb -s <your serial>`"
+            if t in ("-H", "-P", "-L", "-t") and i + 1 < len(rest):
+                i += 2
+                continue
+            if t.startswith("-"):
+                i += 1
+                continue
+            sub = t
+            break
+        if sub == "kill-server":
+            return "`adb kill-server` disconnects every agent's devices"
+        if sub in (None, "devices", "version", "start-server", "help", "--help", "keygen"):
+            return None
+        if not serial:
+            return "adb needs a device: use `adb -s <serial>` (or ANDROID_SERIAL=<serial>)"
+        return check_serial(serial, android, protected, "adb targets")
+
+    if prog in ("gradlew", "gradle"):
+        tasks = [t for t in rest if not t.startswith("-")]
+        device_task = re.compile(r"(^|:)(install|uninstall)[A-Za-z0-9]*$|(^|:)connected[A-Za-z0-9]*(Test|Check)$")
+        if any(device_task.search(t) for t in tasks):
+            serial = local_env.get("ANDROID_SERIAL")
+            if not serial:
+                return "Gradle install/connected tasks hit every connected device; prefix with ANDROID_SERIAL=<serial>"
+            return check_serial(serial, android, protected, "ANDROID_SERIAL is")
+        return None
+
+    if prog == "simctl" or (prog == "xcrun" and "simctl" in rest):
+        args = rest[rest.index("simctl") + 1:] if prog == "xcrun" else rest
+        args = [a for a in args if not a.startswith("-") or a == "-j"]
+        sub = args[0] if args else None
+        if sub in (None, "list", "help", "runtime", "getenv", "create"):
+            return None
+        if "booted" in args[1:] or "all" in args[1:]:
+            return "simctl `booted`/`all` can hit other agents' simulators; pass your leased UDID"
+        udids = UUID_RE.findall(" ".join(args[1:]))
+        if not udids:
+            if ios and any(is_var(a) for a in args[1:]):
+                return None
+            return f"simctl {sub} needs your leased UDID as the device"
+        foreign = [u for u in udids if u not in ios]
+        if foreign:
+            return f"simctl targets {foreign[0]}, which this session has not leased"
+        return None
+
+    if prog == "xcodebuild":
+        dests = [rest[i + 1] for i, t in enumerate(rest[:-1]) if t == "-destination"]
+        actions = {t for t in rest if not t.startswith("-")}
+        for d in dests:
+            if "generic/" in d:
+                continue
+            m = re.search(r"id=([0-9A-Fa-f-]+|\$\{?\w+\}?)", d)
+            if m and is_var(m.group(1)):
+                if not ios:
+                    return "xcodebuild destination uses a variable but this session has no iOS lease"
+            elif m:
+                if m.group(1) not in ios:
+                    return f"xcodebuild destination id={m.group(1)} is not a simulator this session has leased"
+            elif "Simulator" in d or "name=" in d:
+                return "xcodebuild simulator destinations must use `id=<your leased UDID>`, not a name"
+        if not dests and actions & {"test", "test-without-building"}:
+            return "xcodebuild test needs `-destination 'id=<your leased UDID>'`"
+        return None
+
+    if prog == "emulator":
+        if "-list-avds" in rest or "-help" in rest:
+            return None
+        if "-avd" in rest or any(t.startswith("@") for t in rest):
+            return "don't start emulators directly; run `devlease acquire android --wait`"
+        return None
+
+    if prog == "flutter":
+        sub = next((t for t in rest if not t.startswith("-")), None)
+        if sub not in ("run", "install", "drive", "attach", "screenshot", "logs", "test"):
+            return None
+        device = flag_value(rest, ("-d", "--device-id"))
+        if device is None:
+            if sub == "test" and not any("integration_test" in t for t in rest):
+                return None
+            return f"flutter {sub} needs `-d <your leased serial/UDID>`"
+        if device == "all":
+            return "`flutter -d all` hits every device; pass your leased serial/UDID"
+        return check_serial(device, android | ios, protected, "flutter targets")
+
+    if prog == "maestro":
+        sub = next((t for t in rest if not t.startswith("-")), None)
+        if sub not in ("test", "record", "studio"):
+            return None
+        device = flag_value(rest, ("--device", "--udid"))
+        if device is None:
+            return f"maestro {sub} needs `--device <your leased serial/UDID>`"
+        return check_serial(device, android | ios, protected, "maestro targets")
+    return None
+
+
+def check_command(command, leased, protected, env=None):
+    env = {} if env is None else env
+    for segment in split_segments(command):
+        reason = check_segment(tokenize(segment), env, leased, protected)
+        if reason:
+            return reason
+    return None
+
+
+def leased_devices(owner):
+    leased = {"android": set(), "ios": set(), "mcp": set()}
+    for l in owner_leases(owner):
+        if l.get("device"):
+            leased[l["platform"]].add(l["device"])
+        if l.get("mcp_id"):
+            leased["mcp"].add(l["mcp_id"])
+    return leased
+
+
+SHELL_TOOLS = {"bash", "shell", "run_shell_command", "exec_command", "local_shell", "terminal", "execute_command",
+               "run_terminal_cmd", "run_command"}
+
+
+def normalize_payload(data):
+    """Hook payloads differ per harness; return (tool_name, tool_input dict, cwd).
+
+    Claude Code, Codex, Gemini CLI, Copilot (Claude-format events) and the OpenCode plugin send
+    tool_name + tool_input; Copilot's native camelCase events send toolName + toolArgs (a JSON string).
+    """
+    tool = data.get("tool_name") or data.get("toolName") or data.get("tool") or ""
+    args = data.get("tool_input")
+    if args is None:
+        args = data.get("toolArgs", data.get("args", data.get("input")))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {"command": args}
+    if not isinstance(args, dict):
+        args = {}
+    return str(tool), args, data.get("cwd")
+
+
+def shell_command(tool, args):
+    if tool.lower().rsplit("/", 1)[-1] not in SHELL_TOOLS:
+        return None
+    cmd = args.get("command", args.get("cmd"))
+    if isinstance(cmd, list):
+        cmd = shlex.join(str(c) for c in cmd)
+    return cmd if isinstance(cmd, str) else None
+
+
+def mcp_tool_device(tool, args, cfg):
+    if not any(fnmatch.fnmatchcase(tool, p) for p in cfg.get("mcp_tool_patterns", [])):
+        return None
+    for key in cfg.get("mcp_device_args", []):
+        if isinstance(args.get(key), str) and args[key]:
+            return args[key]
+    return None
+
+
+def block(reason, leased):
+    have = ", ".join(f"{p}={d}" for p in ("android", "ios", "mcp") for d in sorted(leased.get(p, ()))) or "none"
+    err(f"devlease: blocked: {reason}.\nYour leased devices: {have}. Get one with "
+        "`devlease acquire android|ios --wait` and use only the serial/UDID (or MCP device id) it prints.")
+    sys.exit(2)
+
+
+def hook_pretool():
+    if os.environ.get("DEVLEASE_HOOK") == "off":
+        return 0
+    raw = sys.stdin.read()
+    if os.environ.get("DEVLEASE_HOOK_LOG"):  # debugging aid: record what the harness sends
+        with open(os.environ["DEVLEASE_HOOK_LOG"], "a") as f:
+            f.write(raw.strip() + "\n")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    tool, tool_input, cwd = normalize_payload(data)
+    cfg = load_config()
+    protected = set(cfg.get("protected_serials", []))
+
+    command = shell_command(tool, tool_input)
+    if command is not None:
+        if not DEVICE_WORDS.search(command):  # cheap pre-filter: most commands never touch a device
+            return 0
+        leased = leased_devices(current_owner(cwd))
+        reason = check_command(command, leased, protected)
+        if reason:
+            block(reason, leased)
+        return 0
+
+    device = mcp_tool_device(tool, tool_input, cfg)
+    if device:
+        leased = leased_devices(current_owner(cwd))
+        if device in protected:
+            block(protected_msg(device), leased)
+        if device not in leased["android"] | leased["ios"] | leased["mcp"]:
+            block(f"MCP device {device} is not leased by this session", leased)
+    return 0
+
+
+def hook_session_end():
+    try:
+        json.load(sys.stdin)
+    except ValueError:
+        pass
+    pid = agent_pid()
+    if pid is None:
+        return 0
+    # Detach so slow shutdowns aren't cut off by the hook timeout.
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "release", "--owner-pid", str(pid)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    return 0
+
+
+# ---------- hook installation per harness ----------
+
+# name: (user file, project file, kind, pre-tool event, matcher, session-end event, timeout)
+HARNESSES = {
+    "claude": (HOME / ".claude/settings.json", ".claude/settings.json", "settings", "PreToolUse", "Bash|mcp__.*",
+               "SessionEnd", 10),
+    "codex": (HOME / ".codex/hooks.json", ".codex/hooks.json", "settings", "PreToolUse", "^(Bash|mcp__.*)$",
+              "SessionEnd", 10),
+    "gemini": (HOME / ".gemini/settings.json", ".gemini/settings.json", "settings", "BeforeTool",
+               "run_shell_command|mcp_.*", "SessionEnd", 10000),  # Gemini timeouts are in ms
+    "copilot": (HOME / ".copilot/hooks/devlease.json", ".github/hooks/devlease.json", "copilot", None, None, None, 10),
+    "opencode": (HOME / ".config/opencode/plugins/devlease.js", ".opencode/plugins/devlease.js", "opencode",
+                 None, None, None, 15),
+}
+HARNESS_HOMES = {"claude": HOME / ".claude", "codex": HOME / ".codex", "gemini": HOME / ".gemini",
+                 "copilot": HOME / ".copilot", "opencode": HOME / ".config/opencode"}
+
+
+def harness_present(agent):
+    return HARNESS_HOMES[agent].is_dir() or bool(shutil.which(agent))
+
+
+def launcher():
+    """The devlease command hooks run: the one on PATH (keeps symlinks, survives upgrades)."""
+    return shutil.which("devlease") or os.path.abspath(sys.argv[0])
+
+
+def hook_file(agent, project):
+    return Path(os.getcwd()) / HARNESSES[agent][1] if project else HARNESSES[agent][0]
+
+
+def is_our_hook(cmd):
+    return isinstance(cmd, str) and "devlease" in cmd and re.search(r"\bhook (pretool|session-end)\b", cmd) is not None
+
+
+def backup(path):
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".devlease-backup"))
+
+
+def strip_settings_hooks(hooks):
+    """Remove devlease entries from a Claude-style hooks dict. Returns True if anything changed."""
+    changed = False
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        new_groups = []
+        for g in groups:
+            inner = g.get("hooks") if isinstance(g, dict) else None
+            if isinstance(inner, list):
+                kept = [h for h in inner if not (isinstance(h, dict) and is_our_hook(h.get("command")))]
+                if len(kept) != len(inner):
+                    changed = True
+                    if not kept:
+                        continue
+                    g = dict(g, hooks=kept)
+            new_groups.append(g)
+        if new_groups:
+            hooks[event] = new_groups
+        else:
+            del hooks[event]
+    return changed
+
+
+def opencode_plugin(cmd):
+    return f"""// devlease guard for OpenCode (v2 plugin API). Generated by `devlease hooks install opencode`.
+// Blocks bash and device-MCP tool calls that target a device this session has not leased.
+import {{ spawnSync }} from "node:child_process"
+
+const DEVLEASE = {json.dumps(cmd)}
+
+function check(tool, input) {{
+  const r = spawnSync(DEVLEASE, ["hook", "pretool"], {{
+    input: JSON.stringify({{ tool_name: tool, tool_input: input ?? {{}}, cwd: process.cwd() }}),
+    encoding: "utf8",
+    timeout: 15000,
+  }})
+  if (r.status === 2) throw new Error((r.stderr || "blocked by devlease").trim())
+}}
+
+export default {{
+  id: "devlease",
+  async setup(ctx) {{
+    await ctx.tool.hook("execute.before", (event) => check(event.tool, event.input))
+  }},
+}}
+"""
+
+
+def install_hooks(agent, project):
+    path = hook_file(agent, project)
+    _, _, kind, pre, matcher, end, timeout = HARNESSES[agent]
+    cmd = shlex.quote(launcher())
+    pre_cmd, end_cmd = f"{cmd} hook pretool", f"{cmd} hook session-end"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "settings":
+        try:
+            data = json.loads(path.read_text() or "{}") if path.exists() else {}
+        except json.JSONDecodeError:
+            die(f"{path} is not valid JSON; fix it first")
+        backup(path)
+        hooks = data.setdefault("hooks", {})
+        strip_settings_hooks(hooks)
+        entry = {"type": "command", "command": pre_cmd, "timeout": timeout}
+        end_entry = {"type": "command", "command": end_cmd, "timeout": timeout}
+        if agent == "gemini":
+            entry["name"], end_entry["name"] = "devlease-guard", "devlease-release"
+        hooks.setdefault(pre, []).append({"matcher": matcher, "hooks": [entry]})
+        hooks.setdefault(end, []).append({"hooks": [end_entry]})
+        write_json(path, data)
+    elif kind == "copilot":
+        write_json(path, {"version": 1, "hooks": {
+            "PreToolUse": [{"type": "command", "bash": pre_cmd, "timeoutSec": timeout}],
+            "SessionEnd": [{"type": "command", "bash": end_cmd, "timeoutSec": timeout}],
+        }})
+    else:
+        path.write_text(opencode_plugin(launcher()))
+    err(f"devlease: installed {agent} hooks in {path}")
+    if agent == "codex":
+        err("devlease: Codex may ask you to review and trust the new hooks (`/hooks` in Codex)")
+
+
+def uninstall_hooks(agent, project):
+    path = hook_file(agent, project)
+    if not path.exists():
+        return False
+    if HARNESSES[agent][2] == "settings":
+        try:
+            data = json.loads(path.read_text() or "{}")
+        except json.JSONDecodeError:
+            err(f"devlease: {path} is not valid JSON; remove the devlease hooks by hand")
+            return False
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict) or not strip_settings_hooks(hooks):
+            return False
+        backup(path)
+        write_json(path, data)
+    else:
+        path.unlink()
+    err(f"devlease: removed {agent} hooks from {path}")
+    return True
+
+
+def hooks_installed(agent, project):
+    path = hook_file(agent, project)
+    if not path.exists():
+        return False
+    if HARNESSES[agent][2] != "settings":
+        return True
+    try:
+        hooks = json.loads(path.read_text() or "{}").get("hooks", {})
+    except json.JSONDecodeError:
+        return False
+    return any(is_our_hook(h.get("command")) for groups in hooks.values() if isinstance(groups, list)
+               for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict))
+
+
+def cmd_hooks(args):
+    if args.agent:
+        agents = [args.agent]
+    elif args.action == "install":
+        agents = [a for a in HARNESSES if harness_present(a)]
+        if not agents:
+            die(f"no supported agent found; pass one of: {', '.join(HARNESSES)}")
+        err(f"devlease: installing hooks for detected agents: {', '.join(agents)}")
+    else:
+        agents = list(HARNESSES)
+    for agent in agents:
+        if args.action == "install":
+            install_hooks(agent, args.project)
+        elif args.action == "uninstall":
+            if not uninstall_hooks(agent, args.project) and args.agent:
+                err(f"devlease: no devlease hooks found for {agent}")
+        else:
+            state = "installed" if hooks_installed(agent, args.project) else "not installed"
+            print(f"{agent}\t{state}\t{hook_file(agent, args.project)}")
+    return 0
+
+
+# ---------- skill / snippet ----------
+
+def share_dir():
+    """Where SKILL.md and snippets live: next to the script in a checkout, or <prefix>/share/devlease."""
+    here = Path(__file__).resolve().parent
+    for d in (here, here.parent / "share/devlease", HOME / ".local/share/devlease"):
+        if (d / "skills/devlease/SKILL.md").exists():
+            return d
+    return None
+
+
+def skill_targets():
+    return {"claude": HOME / ".claude/skills", "agents": HOME / ".agents/skills"}
+
+
+def cmd_skill(args):
+    share = share_dir()
+    if args.action == "path":
+        if not share:
+            die("skill files not found; reinstall devlease")
+        print(share / "skills/devlease")
+        return 0
+    targets = {"custom": Path(args.dir).expanduser()} if args.dir else skill_targets()
+    for base in targets.values():
+        dest = base / "devlease"
+        if args.action == "install":
+            if not share:
+                die(f"skill files not found; install with `npx skills add {REPO} -g -y` instead")
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            elif dest.exists():
+                shutil.rmtree(dest)
+            base.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(share / "skills/devlease", dest)
+            err(f"devlease: installed skill in {dest}")
+        elif dest.is_symlink():
+            dest.unlink()
+            err(f"devlease: removed skill link {dest}")
+        elif dest.exists():
+            shutil.rmtree(dest)
+            err(f"devlease: removed skill {dest}")
+    return 0
+
+
+def cmd_snippet(args):
+    share = share_dir()
+    path = share / "snippets/AGENTS.md" if share else None
+    if not path or not path.exists():
+        die(f"snippet not found; see https://github.com/{REPO}/blob/main/snippets/AGENTS.md")
+    sys.stdout.write(path.read_text())
+    return 0
+
+
+# ---------- uninstall ----------
+
+def confirm(question):
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+UNINSTALL_STEPS = ("devices", "hooks", "skill", "state", "binary")
+
+
+def cmd_uninstall(args):
+    cfg = load_config()
+    picked = args.all or any(getattr(args, s) for s in UNINSTALL_STEPS)
+    interactive = not picked and not args.dry_run and sys.stdin.isatty()
+    if not picked and not args.dry_run and not interactive:
+        die("no terminal to ask in: pass --all, or pick steps with --devices --hooks --skill --state --binary "
+            "(add --dry-run to only list what would be removed)")
+    script = Path(os.path.abspath(sys.argv[0]))
+    brew = "/Cellar/" in str(script.resolve())
+    checkout = not script.is_symlink() and (script.resolve().parent / ".git").exists()
+    share = HOME / ".local/share/devlease"
+    sims = sim_devices()
+    master_udid = cfg["ios"].get("master_udid")
+    sim_targets = [(u, d["name"]) for u, d in sims.items()
+                   if u == master_udid or re.fullmatch(re.escape(SLOT_SIM_PREFIX) + r"\d+", d.get("name", ""))]
+    avds = lease_avds(cfg)
+    hook_targets = [(a, p) for a in HARNESSES for p in (False, True) if hooks_installed(a, p)]
+    skill_dirs = [b / "devlease" for b in skill_targets().values()
+                  if (b / "devlease").exists() or (b / "devlease").is_symlink()]
+
+    steps = [
+        ("devices", "release leases and delete devlease's devices",
+         [f"AVD {a}" for a in avds] + [f"simulator {n} ({u})" for u, n in sim_targets]),
+        ("hooks", "remove guard hooks", [f"{a}: {hook_file(a, p)}" for a, p in hook_targets]),
+        ("skill", "remove the agent skill", [str(d) for d in skill_dirs] or
+         (["skills installed with `npx skills` (if any)"] if shutil.which("npx") else [])),
+        ("state", "remove config, leases and logs", [str(STATE)] if STATE.exists() else []),
+        ("binary", "remove the devlease command",
+         [] if checkout else ["installed with Homebrew: run `brew uninstall devlease` yourself"] if brew
+         else [str(script) + (" (symlink)" if script.is_symlink() else "")] + ([str(share)] if share.exists() else [])),
+    ]
+    chosen = {}
+    for key, label, items in steps:
+        if not items:
+            continue
+        print(f"{label}:")
+        for item in items:
+            print(f"  - {item}")
+        if args.dry_run:
+            continue
+        chosen[key] = confirm(f"  {label}?") if interactive else (args.all or getattr(args, key))
+    if args.dry_run:
+        return 0
+
+    if chosen.get("devices"):
+        with state_lock():
+            for lease in all_leases():
+                stop_device(lease)
+                drop_lease(lease)
+        for a in avds:
+            delete_avd(a)
+        for u, _ in sim_targets:
+            run(["xcrun", "simctl", "shutdown", u], timeout=60)
+            run(["xcrun", "simctl", "delete", u], timeout=60)
+        if not chosen.get("state") and CONFIG.exists():
+            user = read_user_config()
+            user.get("ios", {}).pop("master_udid", None)
+            save_user_config(user)
+        err("devlease: devices deleted")
+    if chosen.get("hooks"):
+        for a, p in hook_targets:
+            uninstall_hooks(a, p)
+    if chosen.get("skill"):
+        if shutil.which("npx"):
+            run(["npx", "-y", "skills", "remove", "devlease", "-g", "-y"], timeout=180)
+        for d in skill_dirs:
+            if d.is_symlink():
+                d.unlink()
+            elif d.exists():
+                shutil.rmtree(d)
+        err("devlease: skill removed")
+    if chosen.get("state"):
+        shutil.rmtree(STATE, ignore_errors=True)
+        err(f"devlease: removed {STATE}")
+    if chosen.get("binary"):
+        if brew:
+            err("devlease: installed with Homebrew; run `brew uninstall devlease`")
+        else:
+            script.unlink(missing_ok=True)
+            shutil.rmtree(share, ignore_errors=True)
+            err(f"devlease: removed {script}")
+    return 0
+
+
+# ---------- main ----------
+
+def main():
+    parser = argparse.ArgumentParser(prog="devlease", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"devlease {__version__}")
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    p = sub.add_parser("acquire", help="lease a device; prints its serial/UDID")
+    p.add_argument("platform", choices=["android", "ios"])
+    p.add_argument("--wait", action="store_true", help="wait for a free slot instead of failing")
+    p.add_argument("--timeout", type=int, default=1800, help="max seconds to wait (default 1800)")
+    p.set_defaults(fn=cmd_acquire)
+
+    p = sub.add_parser("release", help="stop and discard leased devices")
+    p.add_argument("platform", nargs="?", choices=["android", "ios"])
+    p.add_argument("--device", help="release this serial/UDID/MCP id, whoever holds it")
+    p.add_argument("--owner-pid", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--all", action="store_true", help="release every lease")
+    p.set_defaults(fn=cmd_release)
+
+    p = sub.add_parser("mine", help="this owner's devices")
+    p.add_argument("platform", nargs="?", choices=["android", "ios"])
+    p.set_defaults(fn=cmd_mine)
+
+    sub.add_parser("status", help="all slots and who holds them").set_defaults(fn=cmd_status)
+    sub.add_parser("reap", help="free stale leases").set_defaults(fn=cmd_reap)
+
+    p = sub.add_parser("init", help="create a fresh master, open it for setup, build slots")
+    p.add_argument("platform", choices=["android", "ios"])
+    p.add_argument("--force", action="store_true", help="delete an existing master and start fresh")
+    p.add_argument("--no-setup", action="store_true", help="skip the manual setup window (clean device)")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("edit", help="open the existing master to change its data, then rebuild slots")
+    p.add_argument("platform", choices=["android", "ios"])
+    p.set_defaults(fn=cmd_edit)
+
+    p = sub.add_parser("rebuild", help="rebuild slot devices from the master")
+    p.add_argument("platform", choices=["android", "ios"])
+    p.set_defaults(fn=cmd_rebuild)
+
+    p = sub.add_parser("master", help=argparse.SUPPRESS)
+    p.add_argument("platform", choices=["android", "ios"])
+    p.add_argument("--setup", action="store_true")
+    p.set_defaults(fn=cmd_master)
+
+    p = sub.add_parser("config", help="show or change settings")
+    p.add_argument("action", nargs="?", choices=["show", "get", "set", "unset", "path"])
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(fn=cmd_config)
+
+    sub.add_parser("doctor", help="check prerequisites and setup").set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("hook", help="entry point called by agent harness hooks")
+    p.add_argument("event", choices=["pretool", "session-end"])
+    p.set_defaults(fn=lambda a: hook_pretool() if a.event == "pretool" else hook_session_end())
+
+    p = sub.add_parser("hooks", help="install/uninstall guard hooks for agent harnesses")
+    p.add_argument("action", choices=["install", "uninstall", "status"])
+    p.add_argument("agent", nargs="?", choices=list(HARNESSES), help="default: every detected agent")
+    p.add_argument("--project", action="store_true", help="use the project config in the current directory")
+    p.set_defaults(fn=cmd_hooks)
+
+    p = sub.add_parser("skill", help="install the agent skill without npx")
+    p.add_argument("action", choices=["install", "uninstall", "path"])
+    p.add_argument("--dir", help="skills directory (default: ~/.claude/skills and ~/.agents/skills)")
+    p.set_defaults(fn=cmd_skill)
+
+    sub.add_parser("snippet", help="print the AGENTS.md section").set_defaults(fn=cmd_snippet)
+
+    p = sub.add_parser("uninstall", help="remove devices, hooks, skill, state and the binary")
+    p.add_argument("--all", action="store_true", help="every step, no questions")
+    p.add_argument("--devices", action="store_true", help="delete devlease's AVDs and simulators")
+    p.add_argument("--hooks", action="store_true", help="remove guard hooks")
+    p.add_argument("--skill", action="store_true", help="remove the agent skill")
+    p.add_argument("--state", action="store_true", help="remove the state dir (~/.devlease)")
+    p.add_argument("--binary", action="store_true", help="remove the devlease command")
+    p.add_argument("--dry-run", action="store_true", help="only list what would be removed")
+    p.set_defaults(fn=cmd_uninstall)
+
+    args = parser.parse_args()
+    sys.exit(args.fn(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

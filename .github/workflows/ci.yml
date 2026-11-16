@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Lint install.sh
+        run: brew install shellcheck && shellcheck install.sh
+      - name: CLI smoke test
+        run: |
+          export DEVLEASE_HOME="$RUNNER_TEMP/devlease"
+          ./devlease --version
+          ./devlease config set android.slots 3
+          test "$(./devlease config get android.slots)" = 3
+          ./devlease snippet | grep -q "devlease acquire"
+          ./devlease skill path
