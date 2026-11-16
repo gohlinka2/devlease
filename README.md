@@ -28,7 +28,9 @@ devlease: released android-0 (emulator-5580)
 
 devlease only **leases** devices. It doesn't tap, swipe or screenshot. For that, pair it with
 [**Mobile MCP**](https://github.com/mobile-next/mobile-mcp) (recommended) or any similar device MCP
-that takes a device id: pass it the *MCP device id* that `devlease acquire` prints.
+that takes a device id: pass it the *MCP device id* that `devlease acquire` prints. The guard hook
+checks Mobile MCP out of the box; add other device MCPs with
+`devlease config set mcp_servers '["mobile-mcp", "<other-server>"]'`.
 
 > **Requirements:** macOS, Python 3.8+ (ships with Xcode's command line tools). Android: Android
 > Studio's SDK with the emulator and at least one phone system image. iOS: Xcode with an iOS
@@ -161,7 +163,8 @@ short and always loaded, so agents don't run `adb` before they think of the skil
 | `ios.device_type` / `ios.runtime` | newest iPhone / iOS | Used by `devlease init ios`, e.g. `com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro`. |
 | `protected_serials` | `[]` | Devices agents must never touch, e.g. your physical phone's serial. |
 | `agent_names` | `[]` | Extra agent process names for owner detection. |
-| `mcp_tool_patterns` | `["*mobile-mcp*", "mobile_*"]` | MCP tools whose device argument the guard hook checks (glob). Add your device MCP here. |
+| `mcp_servers` | `["mobile-mcp"]` | Device MCP servers (the name you gave the server in your agent's MCP config) whose `device` argument the guard hook checks. Hooks only run for these servers' tools; other MCP servers (Figma, GitHub, ...) never reach devlease. Installed hooks update automatically when you change this. |
+| `mcp_tool_patterns` | `["mobile_*"]` | Extra tool-name globs, for agents that call MCP tools without the server prefix. |
 | `mcp_device_args` | `["device", "deviceId", "device_id", "udid", "serial"]` | Argument names that carry the device id. |
 
 Environment: `DEVLEASE_HOME` (state dir, default `~/.devlease`), `ANDROID_HOME` /

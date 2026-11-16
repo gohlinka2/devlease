@@ -133,6 +133,26 @@ class PayloadTests(unittest.TestCase):
             self.assertEqual(dl.mcp_tool_device(tool, {"device": "lease-android-0"}, cfg), "lease-android-0", tool)
         self.assertIsNone(dl.mcp_tool_device("mcp__github__get_issue", {"device": "x"}, cfg))
         self.assertIsNone(dl.mcp_tool_device("mcp__mobile-mcp__mobile_list_available_devices", {}, cfg))
+        # unrelated MCPs are never checked, even when they take a `device`-like argument
+        for tool in ("mcp__pencil__execute", "mcp__plugin_figma_figma__get_screenshot", "mcp_pencil_save",
+                     "mcp__mobile-mcpx__tap", "pencil/execute"):
+            self.assertIsNone(dl.mcp_tool_device(tool, {"device": "x"}, cfg), tool)
+
+    def test_matchers_only_cover_device_servers(self):
+        import re
+        cfg = dict(dl.load_config(), mcp_servers=["mobile-mcp", "my.dev"])
+        m = dl.hook_matcher("claude", cfg)
+        self.assertEqual(m, "Bash|mcp__mobile-mcp__.*|mcp__my\\.dev__.*")
+        rx = re.compile(f"^(?:{m})$")
+        self.assertTrue(rx.match("mcp__mobile-mcp__mobile_take_screenshot"))
+        self.assertTrue(rx.match("mcp__my.dev__tap"))
+        for other in ("mcp__pencil__execute", "mcp__plugin_figma_figma__use_figma", "mcp__my_dev__tap"):
+            self.assertFalse(rx.match(other), other)
+        self.assertEqual(dl.hook_matcher("codex", dict(cfg, mcp_servers=[])), "^(Bash)$")
+        js = re.compile(dl.opencode_tool_regex(dl.load_config()))
+        self.assertTrue(js.search("mobile-mcp_mobile_take_screenshot"))
+        self.assertTrue(js.search("mobile_take_screenshot"))
+        self.assertFalse(js.search("pencil_execute"))
 
 
 class HookTests(unittest.TestCase):
@@ -202,7 +222,7 @@ class InstallTests(unittest.TestCase):
         data = json.loads(path.read_text())
         pre = data["hooks"]["PreToolUse"]
         self.assertEqual(len(pre), 2)
-        self.assertEqual(pre[1]["matcher"], "Bash|mcp__.*")
+        self.assertEqual(pre[1]["matcher"], "Bash|mcp__mobile-mcp__.*")
         self.assertEqual(pre[1]["hooks"][0]["command"], "/usr/local/bin/devlease hook pretool")
         self.assertEqual(len(data["hooks"]["SessionEnd"]), 1)
         self.assertTrue(dl.hooks_installed("claude", False))
@@ -221,13 +241,13 @@ class InstallTests(unittest.TestCase):
             dl.install_hooks("claude", False)
         pre = json.loads(path.read_text())["hooks"]["PreToolUse"]
         self.assertEqual(len(pre), 1)
-        self.assertEqual(pre[0]["matcher"], "Bash|mcp__.*")
+        self.assertEqual(pre[0]["matcher"], "Bash|mcp__mobile-mcp__.*")
 
     def test_gemini_ms_timeout(self):
         with redirect_stderr(io.StringIO()):
             dl.install_hooks("gemini", False)
         entry = json.loads((self.tmp / "gemini.json").read_text())["hooks"]["BeforeTool"][0]
-        self.assertEqual(entry["matcher"], "run_shell_command|mcp_.*")
+        self.assertEqual(entry["matcher"], "run_shell_command|mcp_mobile-mcp_.*")
         self.assertEqual(entry["hooks"][0]["timeout"], 10000)
 
     def test_copilot_and_opencode_files(self):

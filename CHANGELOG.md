@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 (2026-11-16)
+
+- Guard hooks now run only for shell tools and the configured device MCP servers (new `mcp_servers`
+  setting, default `["mobile-mcp"]`), not for every MCP tool. Other MCP servers never start devlease.
+  Changing `mcp_servers` / `mcp_tool_patterns` rewrites installed hooks. Run `devlease hooks install`
+  once after upgrading to narrow existing hooks.
+- `mcp_tool_patterns` now defaults to `["mobile_*"]` (extra globs only).
+
 ## 0.1.1 (2026-11-16)
 
 - `uninstall` no longer lists the same hook file twice when run from the home directory.

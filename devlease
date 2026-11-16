@@ -47,7 +47,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 REPO = "gohlinka2/devlease"
 HOME = Path.home()
@@ -89,7 +89,8 @@ DEFAULT_CONFIG = {
     },
     "protected_serials": [],     # devices agents must never use (e.g. your physical phone)
     "agent_names": [],           # extra agent process names, added to the built-in list
-    "mcp_tool_patterns": ["*mobile-mcp*", "mobile_*"],   # MCP tools whose device argument is checked
+    "mcp_servers": ["mobile-mcp"],     # device MCP servers (names as configured in your agent) the hook checks
+    "mcp_tool_patterns": ["mobile_*"],  # extra tool-name globs, for agents that drop the server prefix
     "mcp_device_args": ["device", "deviceId", "device_id", "udid", "serial"],
 }
 
@@ -1024,6 +1025,7 @@ def cmd_config(args):
         err(f"devlease: {args.key} = {json.dumps(value)}")
         if args.key == "android.slots":
             err("devlease: run `devlease rebuild android` to build the slot AVDs")
+        refresh_hooks_if_needed(args.key)
         return 0
     user = read_user_config()  # unset
     node = user
@@ -1032,7 +1034,18 @@ def cmd_config(args):
         node = node.get(p, {})
     node.pop(parts[-1], None)
     save_user_config(user)
+    refresh_hooks_if_needed(args.key)
     return 0
+
+
+def refresh_hooks_if_needed(key):
+    """Hook matchers embed mcp_servers / mcp_tool_patterns, so rewrite installed hooks when those change."""
+    if key not in ("mcp_servers", "mcp_tool_patterns"):
+        return
+    for agent in HARNESSES:
+        for project in (False, True):
+            if hooks_installed(agent, project):
+                install_hooks(agent, project)
 
 
 def cmd_doctor(args):
@@ -1375,8 +1388,19 @@ def shell_command(tool, args):
     return cmd if isinstance(cmd, str) else None
 
 
+def server_tool_regex(servers):
+    """Tool names of these MCP servers in any agent's naming: mcp__srv__x, mcp_srv_x, srv/x, srv_x, srv-x."""
+    alts = "|".join(re.escape(s) for s in servers if s)
+    return re.compile(rf"^(?:mcp__?)?(?:{alts})(?:__|[_/.:-])") if alts else None
+
+
+def is_device_mcp_tool(tool, cfg):
+    rx = server_tool_regex(cfg.get("mcp_servers", []))
+    return bool(rx and rx.match(tool)) or any(fnmatch.fnmatchcase(tool, p) for p in cfg.get("mcp_tool_patterns", []))
+
+
 def mcp_tool_device(tool, args, cfg):
-    if not any(fnmatch.fnmatchcase(tool, p) for p in cfg.get("mcp_tool_patterns", [])):
+    if not is_device_mcp_tool(tool, cfg):
         return None
     for key in cfg.get("mcp_device_args", []):
         if isinstance(args.get(key), str) and args[key]:
@@ -1447,18 +1471,43 @@ def hook_session_end():
 
 # name: (user file, project file, kind, pre-tool event, matcher, session-end event, timeout)
 HARNESSES = {
-    "claude": (HOME / ".claude/settings.json", ".claude/settings.json", "settings", "PreToolUse", "Bash|mcp__.*",
+    "claude": (HOME / ".claude/settings.json", ".claude/settings.json", "settings", "PreToolUse", "Bash|{mcp}",
                "SessionEnd", 10),
-    "codex": (HOME / ".codex/hooks.json", ".codex/hooks.json", "settings", "PreToolUse", "^(Bash|mcp__.*)$",
+    "codex": (HOME / ".codex/hooks.json", ".codex/hooks.json", "settings", "PreToolUse", "^(Bash|{mcp})$",
               "SessionEnd", 10),
     "gemini": (HOME / ".gemini/settings.json", ".gemini/settings.json", "settings", "BeforeTool",
-               "run_shell_command|mcp_.*", "SessionEnd", 10000),  # Gemini timeouts are in ms
+               "run_shell_command|{mcp}", "SessionEnd", 10000),  # Gemini timeouts are in ms
     "copilot": (HOME / ".copilot/hooks/devlease.json", ".github/hooks/devlease.json", "copilot", None, None, None, 10),
     "opencode": (HOME / ".config/opencode/plugins/devlease.js", ".opencode/plugins/devlease.js", "opencode",
                  None, None, None, 15),
 }
 HARNESS_HOMES = {"claude": HOME / ".claude", "codex": HOME / ".codex", "gemini": HOME / ".gemini",
                  "copilot": HOME / ".copilot", "opencode": HOME / ".config/opencode"}
+
+
+# How each harness names MCP tools in its hook matcher ({s} = server name).
+MCP_MATCHER_FORMS = {"claude": "mcp__{s}__.*", "codex": "mcp__{s}__.*", "gemini": "mcp_{s}_.*"}
+
+
+def js_regex_escape(s):
+    return re.sub(r"([.^$*+?()\[\]{}|\\/])", r"\\\1", s)  # no "\-": invalid in some JS regex modes
+
+
+def hook_matcher(agent, cfg):
+    """The harness matcher: shell tool plus only the configured device MCP servers, never all MCP tools."""
+    template = HARNESSES[agent][4]
+    forms = [MCP_MATCHER_FORMS[agent].format(s=js_regex_escape(s)) for s in cfg.get("mcp_servers", []) if s]
+    if not forms:
+        return template.replace("|{mcp}", "")
+    return template.replace("{mcp}", "|".join(forms))
+
+
+def opencode_tool_regex(cfg):
+    """JS regex source for the OpenCode plugin's pre-filter (servers + extra globs)."""
+    alts = [rf"^{js_regex_escape(s)}[_/.:-]" for s in cfg.get("mcp_servers", []) if s]
+    alts += ["^" + js_regex_escape(p).replace("\\*", ".*").replace("\\?", ".") + "$"
+             for p in cfg.get("mcp_tool_patterns", []) if p]
+    return "|".join(alts) or "$^"
 
 
 def harness_present(agent):
@@ -1508,12 +1557,14 @@ def strip_settings_hooks(hooks):
     return changed
 
 
-def opencode_plugin(cmd):
+def opencode_plugin(cmd, cfg):
     return f"""// devlease guard for OpenCode (v2 plugin API). Generated by `devlease hooks install opencode`.
 // Blocks bash and device-MCP tool calls that target a device this session has not leased.
 import {{ spawnSync }} from "node:child_process"
 
 const DEVLEASE = {json.dumps(cmd)}
+// Only shell commands and the configured device MCP servers are checked (`devlease config set mcp_servers ...`).
+const DEVICE_MCP = new RegExp({json.dumps(opencode_tool_regex(cfg))})
 
 function check(tool, input) {{
   const r = spawnSync(DEVLEASE, ["hook", "pretool"], {{
@@ -1527,7 +1578,9 @@ function check(tool, input) {{
 export default {{
   id: "devlease",
   async setup(ctx) {{
-    await ctx.tool.hook("execute.before", (event) => check(event.tool, event.input))
+    await ctx.tool.hook("execute.before", (event) => {{
+      if (event.tool === "bash" || DEVICE_MCP.test(event.tool)) check(event.tool, event.input)
+    }})
   }},
 }}
 """
@@ -1535,7 +1588,8 @@ export default {{
 
 def install_hooks(agent, project):
     path = hook_file(agent, project)
-    _, _, kind, pre, matcher, end, timeout = HARNESSES[agent]
+    _, _, kind, pre, _, end, timeout = HARNESSES[agent]
+    cfg = load_config()
     cmd = shlex.quote(launcher())
     pre_cmd, end_cmd = f"{cmd} hook pretool", f"{cmd} hook session-end"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1551,7 +1605,7 @@ def install_hooks(agent, project):
         end_entry = {"type": "command", "command": end_cmd, "timeout": timeout}
         if agent == "gemini":
             entry["name"], end_entry["name"] = "devlease-guard", "devlease-release"
-        hooks.setdefault(pre, []).append({"matcher": matcher, "hooks": [entry]})
+        hooks.setdefault(pre, []).append({"matcher": hook_matcher(agent, cfg), "hooks": [entry]})
         hooks.setdefault(end, []).append({"hooks": [end_entry]})
         write_json(path, data)
     elif kind == "copilot":
@@ -1560,7 +1614,7 @@ def install_hooks(agent, project):
             "SessionEnd": [{"type": "command", "bash": end_cmd, "timeoutSec": timeout}],
         }})
     else:
-        path.write_text(opencode_plugin(launcher()))
+        path.write_text(opencode_plugin(launcher(), cfg))
     err(f"devlease: installed {agent} hooks in {path}")
     if agent == "codex":
         err("devlease: Codex may ask you to review and trust the new hooks (`/hooks` in Codex)")

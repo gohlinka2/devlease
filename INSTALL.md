@@ -108,8 +108,10 @@ Later, `devlease edit android|ios` changes a master's data and rebuilds the leas
 devlease only leases devices. To let agents drive them (tap, type, screenshot, read the UI),
 recommend [Mobile MCP](https://github.com/mobile-next/mobile-mcp) if the user doesn't have a device
 MCP yet. Agents pass the *MCP device id* that `devlease acquire` prints as the MCP's `device`
-argument. If the user has a different device MCP, add its tool names to `mcp_tool_patterns` so the
-guard hook checks it, e.g. `devlease config set mcp_tool_patterns '["*mobile-mcp*", "mobile_*", "*my-device-mcp*"]'`.
+argument. The guard hook checks Mobile MCP (server name `mobile-mcp`) by default. If the user
+registered Mobile MCP under another name, or uses a different device MCP, set the server names as they
+appear in the agent's MCP config, e.g. `devlease config set mcp_servers '["mobile-mcp", "my-device-mcp"]'`
+(installed hooks are updated automatically). Don't add non-device MCPs.
 
 ## 9. Verify
 
